@@ -10,6 +10,29 @@ Both worked jointly with direct insight from the Lead Developer.
 
 ---
 
+# ⚙️ Technology Stack
+
+### 🟦 Python  
+Core backend language powering all systems.
+
+### 🤖 discord.py (v2)  
+Used for commands, slash commands, interactions, mod tools, jail system, tickets, and event listeners.
+
+### 🗄 aiosqlite  
+Async database layer for:  
+- warnings  
+- notes  
+- strikes  
+- jail system  
+- config  
+- safelist  
+- logs  
+
+### 📁 Auto-Generated Databases  
+All `.db` files are **automatically created** on startup if missing — zero manual setup.
+
+---
+
 # 📌 Features Overview
 
 ## 🔧 Moderation Commands
