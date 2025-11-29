@@ -8,6 +8,7 @@
 #  - Jail role config + jail/unjail (stores/restores roles)
 #  - Mute/unmute using Discord's built-in timeout (Member.edit(timeout=...))
 #  - Ban/unban/kick
+#  - DM Notifications for moderation actions
 #  - SQLite database persistence
 # Requirements: discord.py v2.x, sqlite3
 # Usage: put in cogs folder and load as an extension
@@ -29,8 +30,6 @@ UNIT_MULTIPLIERS = {
 }
 
 MAX_MUTE_DAYS = 28  # Discord maximum timeout
-
-
 
 DB_FILE = "moderation_database.db"
 
@@ -247,21 +246,96 @@ class ModerationCog(commands.Cog):
                 (str(guild_id), staff, log, jail)
             )
 
-    # ----------------- staff check -----------------
+    # ----------------- permission checks -----------------
 
-    async def is_staff(self, member: discord.Member):
-        """Basic in-code check for staff: configured staff role OR Manage Messages / Kick Members."""
-        # Get the staff role asynchronously
-        staff_role_id = await self.get_guild_setting(member.guild.id, 'staff_role')
+    async def has_staff_or_mute_perms(self, member: discord.Member):
+        """Check if member has Administrator OR mute permissions (staff role or moderate_members)"""
+        if member.guild_permissions.administrator:
+            return True
         
+        # Check for staff role
+        staff_role_id = await self.get_guild_setting(member.guild.id, 'staff_role')
         if staff_role_id:
             staff_role = discord.utils.get(member.roles, id=int(staff_role_id))
             if staff_role:
                 return True
         
-        # fallback on permissions
-        perms = member.guild_permissions
-        return perms.manage_messages or perms.kick_members or perms.ban_members
+        # Check for mute permission
+        return member.guild_permissions.moderate_members
+
+    def staff_or_mute_only():
+        async def predicate(ctx):
+            if ctx.guild is None:
+                raise commands.CheckFailure("This command must be used in a server.")
+            cog: ModerationCog = ctx.cog
+            if await cog.has_staff_or_mute_perms(ctx.author):
+                return True
+            raise commands.CheckFailure("You need Administrator permissions, staff role, or Moderate Members permission.")
+        return commands.check(predicate)
+
+    def kick_or_admin_only():
+        async def predicate(ctx):
+            if ctx.guild is None:
+                raise commands.CheckFailure("This command must be used in a server.")
+            if ctx.author.guild_permissions.administrator or ctx.author.guild_permissions.kick_members:
+                return True
+            raise commands.CheckFailure("You need Administrator or Kick Members permissions.")
+        return commands.check(predicate)
+
+    def ban_or_admin_only():
+        async def predicate(ctx):
+            if ctx.guild is None:
+                raise commands.CheckFailure("This command must be used in a server.")
+            if ctx.author.guild_permissions.administrator or ctx.author.guild_permissions.ban_members:
+                return True
+            raise commands.CheckFailure("You need Administrator or Ban Members permissions.")
+        return commands.check(predicate)
+
+    # ----------------- DM Notification -----------------
+
+    async def send_dm_notification(self, user: discord.User, action: str, reason: str, duration: str = None, moderator: discord.Member = None):
+        """Send DM notification to user about moderation action"""
+        try:
+            # Create a simple text-based DM first (more reliable than embeds)
+            message_lines = []
+            message_lines.append(f"🔔 **Moderation Action Notification**")
+            message_lines.append("")
+            message_lines.append(f"**Action:** {action}")
+            
+            if moderator and hasattr(moderator, 'guild') and moderator.guild:
+                message_lines.append(f"**Server:** {moderator.guild.name}")
+            else:
+                message_lines.append(f"**Server:** Unknown Server")
+                
+            if duration:
+                message_lines.append(f"**Duration:** {duration}")
+                
+            message_lines.append(f"**Reason:** {reason}")
+            
+            if moderator:
+                message_lines.append(f"**Moderator:** {moderator.display_name}")
+                
+            message_lines.append("")
+            message_lines.append("If you believe this was a mistake, please contact server staff.")
+            
+            message = "\n".join(message_lines)
+            
+            await user.send(message)
+            print(f"✅ DM notification sent successfully to {user} for {action}")
+            return True
+            
+        except discord.Forbidden:
+            # User has DMs disabled or blocked the bot
+            print(f"❌ DM Forbidden: User {user} has DMs disabled or blocked the bot")
+            return False
+        except discord.HTTPException as e:
+            # Other Discord API errors
+            print(f"❌ DM HTTP Error for {user}: {e}")
+            return False
+        except Exception as e:
+            # Any other errors
+            print(f"❌ DM Unknown Error for {user}: {e}")
+            return False
 
     async def is_protected(self, guild: discord.Guild, target: discord.Member):
         # Check user safelist
@@ -296,16 +370,23 @@ class ModerationCog(commands.Cog):
         except Exception:
             pass
 
-    # ----------------- checks -----------------
-    def staff_only():
-        async def predicate(ctx):
-            if ctx.guild is None:
-                raise commands.CheckFailure("This command must be used in a server.")
-            cog: ModerationCog = ctx.cog
-            if await cog.is_staff(ctx.author):
-                return True
-            raise commands.CheckFailure("You need the staff role or Manage Messages / Kick Members permission.")
-        return commands.check(predicate)
+    # ----------------- Test DM Command -----------------
+
+    @commands.command(name="testdm")
+    @staff_or_mute_only()
+    async def test_dm(self, ctx, member: discord.Member):
+        """Test if DM notifications are working"""
+        result = await self.send_dm_notification(
+            user=member,
+            action="Test Notification",
+            reason="This is a test to check if DM notifications are working properly.",
+            moderator=ctx.author
+        )
+        
+        if result:
+            await ctx.send(embed=create_success("DM Test", f"✅ DM sent successfully to {member.mention}"))
+        else:
+            await ctx.send(embed=create_error(f"❌ Failed to send DM to {member.mention}. User may have DMs disabled."))
 
     # ----------------- commands: setup -----------------
 
@@ -351,7 +432,7 @@ class ModerationCog(commands.Cog):
         await self.log(ctx.guild, create_mod_embed("Config", f"Jail role set to {role.name} ({role.id}) by {ctx.author}"))
 
     @commands.command(name="config")
-    @staff_only()
+    @staff_or_mute_only()
     async def show_config(self, ctx):
         staff = await self.get_guild_setting(ctx.guild.id, 'staff_role')
         logc = await self.get_guild_setting(ctx.guild.id, 'log_channel')
@@ -389,7 +470,7 @@ class ModerationCog(commands.Cog):
             "`!safelist remove <@user/@role or id>`\n"
             "`!safelist list`"
         ))
-#   -------------------- safelist add ---------------------
+
     @safelist_group.command(name="add")
     @commands.has_permissions(administrator=True)
     async def safelist_add(self, ctx, *, target: str):
@@ -442,7 +523,6 @@ class ModerationCog(commands.Cog):
             await self.log(ctx.guild, create_mod_embed("Safelist", f"{ctx.author} added {added} to safelist."))
         else:
             await ctx.send(embed=create_error("❌ Could not add target to safelist.\nMake sure you mention a valid user or role."))
-# -----------------------------------------safelist remove ----------------------------------------
 
     @safelist_group.command(name="remove")
     @commands.has_permissions(administrator=True)
@@ -504,7 +584,7 @@ class ModerationCog(commands.Cog):
     # ----------------- warnings -----------------
 
     @commands.command(name="warn")
-    @staff_only()
+    @staff_or_mute_only()
     async def warn(self, ctx, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
         if await self.is_protected(ctx.guild, member):
             await ctx.send(embed=create_error("Target is protected by safelist — action denied."))
@@ -518,13 +598,21 @@ class ModerationCog(commands.Cog):
             (wid, str(ctx.guild.id), str(member.id), str(ctx.author.id), reason, timestamp)
         )
         
-        await ctx.send(embed=create_success("User Warned", f"{member.mention} was warned.\nID: `{wid}`\nReason: {reason}"))
-        await self.log(ctx.guild, create_mod_embed("Warn", f"{ctx.author} warned {member} (ID: {wid}). Reason: {reason}"))
-
-#   --------------------------------------- warning list ----------------------------------------
+        # Send DM notification
+        dm_sent = await self.send_dm_notification(
+            user=member,
+            action="Warning",
+            reason=reason,
+            moderator=ctx.author
+        )
+        
+        dm_status = " (DM sent)" if dm_sent else " (DM failed)"
+        
+        await ctx.send(embed=create_success("User Warned", f"{member.mention} was warned.{dm_status}\nID: `{wid}`\nReason: {reason}"))
+        await self.log(ctx.guild, create_mod_embed("Warn", f"{ctx.author} warned {member} (ID: {wid}). Reason: {reason}{dm_status}"))
 
     @commands.command(name="warnlist")
-    @staff_only()
+    @staff_or_mute_only()
     async def warnlist(self, ctx, member: discord.Member):
         warns = await self.fetchall_db(
             "SELECT id, moderator_id, reason, timestamp FROM warnings WHERE guild_id = ? AND user_id = ?",
@@ -543,10 +631,8 @@ class ModerationCog(commands.Cog):
         
         await ctx.send(embed=create_mod_embed(f"Warnings for {member}", "\n".join(lines)))
 
-#   --------------------------------------Remove Warning ---------------------------------------
-
     @commands.command(name="removewarn")
-    @staff_only()
+    @staff_or_mute_only()
     async def removewarn(self, ctx, member: discord.Member, warn_id: str):
         # FIX: Check if the warning exists first
         existing_warn = await self.fetchone_db(
@@ -566,11 +652,9 @@ class ModerationCog(commands.Cog):
         
         await ctx.send(embed=create_success("Warning Removed", f"Removed warn `{warn_id}` from {member.mention}"))
         await self.log(ctx.guild, create_mod_embed("Warn Removed", f"{ctx.author} removed warn `{warn_id}` from {member}."))
-       
-#   --------------------------------------Clear Warning ---------------------------------------
 
     @commands.command(name="clearwarns")
-    @staff_only()
+    @staff_or_mute_only()
     async def clearwarns(self, ctx, member: discord.Member):
         # Check if there are any warnings first
         existing_warns = await self.fetchone_db(
@@ -593,7 +677,7 @@ class ModerationCog(commands.Cog):
 
     # ----------------- notes -----------------
     @commands.command(name="note")
-    @staff_only()
+    @staff_or_mute_only()
     async def note(self, ctx, member: discord.Member, *, note_text: str):
         nid = uuid.uuid4().hex[:8]
         timestamp = datetime.datetime.utcnow().isoformat()
@@ -605,10 +689,9 @@ class ModerationCog(commands.Cog):
         
         await ctx.send(embed=create_success("Note Added", f"Note added to {member.mention} (ID: `{nid}`)."))
         await self.log(ctx.guild, create_mod_embed("Note", f"{ctx.author} added note to {member}: {note_text}"))
-    
-    # ----------------- note list -----------------
+
     @commands.command(name="notelist")
-    @staff_only()
+    @staff_or_mute_only()
     async def notelist(self, ctx, member: discord.Member):
         notes = await self.fetchall_db(
             "SELECT id, author_id, note, timestamp FROM notes WHERE guild_id = ? AND user_id = ?",
@@ -626,11 +709,10 @@ class ModerationCog(commands.Cog):
             lines.append(f"• ID: `{n[0]}` — {n[2]} (by {author_name} at {n[3]})")
         
         await ctx.send(embed=create_mod_embed(f"Notes for {member}", "\n".join(lines)))
-    
-    # ----------------- Remove note -----------------
+
     @commands.command(name="removenote")
-    @staff_only()
-    async def removenote(self, ctx, member: discord.Member, note_id: str):  # command syntax will be .removenote @user note_id 
+    @staff_or_mute_only()
+    async def removenote(self, ctx, member: discord.Member, note_id: str):
         # Check if the note exists first
         existing_note = await self.fetchone_db(
             "SELECT id FROM notes WHERE guild_id = ? AND user_id = ? AND id = ?",
@@ -646,11 +728,10 @@ class ModerationCog(commands.Cog):
         await ctx.send(embed=create_success("Note Removed", f"Removed note `{note_id}` from {member.mention}"))
         await self.log(ctx.guild, create_mod_embed("Note Removed", f"{ctx.author} removed note `{note_id}` from {member}."))
 
-
     # ----------------- mute/unmute using Discord timeout -----------------
 
     @commands.command(name="mute")
-    @staff_only()
+    @staff_or_mute_only()
     async def mute(self, ctx, member: discord.Member, duration: Optional[str] = None, *, reason: Optional[str] = "No reason provided"):
         if await self.is_protected(ctx.guild, member):
             await ctx.send(embed=create_error("Target is protected by safelist — action denied."))
@@ -684,42 +765,74 @@ class ModerationCog(commands.Cog):
                 duration_str = "indefinite (max 28 days)"
             
             await member.timeout(until, reason=f"{reason} (by {ctx.author})")
+            
+            # Send DM notification
+            dm_sent = await self.send_dm_notification(
+                user=member,
+                action="Mute",
+                reason=reason,
+                duration=duration_str,
+                moderator=ctx.author
+            )
+            
+            dm_status = " (DM sent)" if dm_sent else " (DM failed)"
+            
             await ctx.send(embed=create_success(
                 "Muted", 
-                f"{member.mention} has been timed out.\nReason: {reason}\nDuration: {duration_str}"
+                f"{member.mention} has been timed out.{dm_status}\nReason: {reason}\nDuration: {duration_str}"
             ))
             await self.log(ctx.guild, create_mod_embed(
                 "Muted", 
-                f"{ctx.author} muted {member} until {until.isoformat()} — Reason: {reason}"
+                f"{ctx.author} muted {member} until {until.isoformat()} — Reason: {reason}{dm_status}"
             ))
         
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not mute user: {e}"))
 
-#   -------------------------------- unmute -----------------------------
-
     @commands.command(name="unmute")
-    @staff_only()
+    @staff_or_mute_only()
     async def unmute(self, ctx, member: discord.Member):
         try:
             await member.timeout(None, reason=f"Unmuted by {ctx.author}")
-            await ctx.send(embed=create_success("Unmuted", f"{member.mention} has been unmuted."))
-            await self.log(ctx.guild, create_mod_embed("Unmuted", f"{ctx.author} removed timeout for {member}."))
+            
+            # Send DM notification
+            dm_sent = await self.send_dm_notification(
+                user=member,
+                action="Unmute",
+                reason="Timeout removed",
+                moderator=ctx.author
+            )
+            
+            dm_status = " (DM sent)" if dm_sent else " (DM failed)"
+            
+            await ctx.send(embed=create_success("Unmuted", f"{member.mention} has been unmuted.{dm_status}"))
+            await self.log(ctx.guild, create_mod_embed("Unmuted", f"{ctx.author} removed timeout for {member}.{dm_status}"))
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not unmute user: {e}"))
 
     # ----------------- ban/unban/kick -----------------
 
     @commands.command(name="ban")
-    @commands.has_permissions(ban_members=True)
+    @ban_or_admin_only()
     async def ban(self, ctx, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
         if await self.is_protected(ctx.guild, member):
             await ctx.send(embed=create_error("Target is protected by safelist — action denied."))
             return
+        
+        # Send DM notification before banning
+        dm_sent = await self.send_dm_notification(
+            user=member,
+            action="Ban",
+            reason=reason,
+            moderator=ctx.author
+        )
+        
+        dm_status = " (DM sent)" if dm_sent else " (DM failed)"
+        
         try:
             await member.ban(reason=f"{reason} (by {ctx.author})")
-            await ctx.send(embed=create_success("Banned", f"{member} has been banned."))
-            await self.log(ctx.guild, create_mod_embed("Ban", f"{ctx.author} banned {member}. Reason: {reason}"))
+            await ctx.send(embed=create_success("Banned", f"{member} has been banned.{dm_status}"))
+            await self.log(ctx.guild, create_mod_embed("Ban", f"{ctx.author} banned {member}. Reason: {reason}{dm_status}"))
             # Record ban in database
             timestamp = datetime.datetime.utcnow().isoformat()
             await self.execute_db(
@@ -729,10 +842,8 @@ class ModerationCog(commands.Cog):
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not ban member: {e}"))
 
-# -------------------unban ------------------------------------------------
-
     @commands.command(name="unban")
-    @commands.has_permissions(ban_members=True)
+    @ban_or_admin_only()
     async def unban(self, ctx, user_id: str):
         try:
             uid = int(user_id)
@@ -740,29 +851,113 @@ class ModerationCog(commands.Cog):
             await ctx.send(embed=create_error("Invalid user ID."))
             return
         try:
-            bans = await ctx.guild.bans()
-            for ban_entry in bans:
-                if ban_entry.user.id == uid:
-                    await ctx.guild.unban(ban_entry.user, reason=f"Unbanned by {ctx.author}")
-                    await ctx.send(embed=create_success("Unbanned", f"User {ban_entry.user} has been unbanned."))
-                    await self.log(ctx.guild, create_mod_embed("Unban", f"{ctx.author} unbanned {ban_entry.user}."))
-                    return
+            # Use fetch_ban for discord.py v2.x
+            user = await ctx.guild.fetch_ban(discord.Object(id=uid))
+            await ctx.guild.unban(user.user, reason=f"Unbanned by {ctx.author}")
+            await ctx.send(embed=create_success("Unbanned", f"User {user.user} has been unbanned."))
+            await self.log(ctx.guild, create_mod_embed("Unban", f"{ctx.author} unbanned {user.user}."))
+        except discord.NotFound:
             await ctx.send(embed=create_error("User ID not found in ban list."))
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not unban user: {e}"))
 
-# ------------------------------------------- kick --------------------------------
+    @commands.command(name="hackban")
+    @ban_or_admin_only()
+    async def hackban(self, ctx, user_id: str, *, reason: Optional[str] = "No reason provided"):
+        """
+        Ban a user who isn't in the server by their ID.
+        Usage: !hackban <user_id> [reason]
+        """
+        try:
+            uid = int(user_id)
+        except ValueError:
+            await ctx.send(embed=create_error("Invalid user ID. Please provide a valid numeric user ID."))
+            return
+        
+        # Check if user is already banned
+        try:
+            # Use fetch_ban for discord.py v2.x
+            await ctx.guild.fetch_ban(discord.Object(id=uid))
+            await ctx.send(embed=create_error("This user is already banned."))
+            return
+        except discord.NotFound:
+            # User is not banned, continue
+            pass
+        except Exception as e:
+            await ctx.send(embed=create_error(f"Could not check ban list: {e}"))
+            return
+        
+        # Check if user is in safelist
+        user_result = await self.fetchone_db(
+            "SELECT * FROM safelist WHERE guild_id = ? AND type = 'user' AND target_id = ?",
+            (str(ctx.guild.id), str(uid))
+        )
+        if user_result:
+            await ctx.send(embed=create_error("Target is protected by safelist — action denied."))
+            return
+        
+        try:
+            # Create a user object from ID
+            user = await self.bot.fetch_user(uid)
+            
+            # Send DM notification before banning
+            dm_sent = await self.send_dm_notification(
+                user=user,
+                action="Ban",
+                reason=reason,
+                moderator=ctx.author
+            )
+            
+            dm_status = " (DM sent)" if dm_sent else " (DM failed)"
+            
+            # Ban the user
+            await ctx.guild.ban(user, reason=f"{reason} (hackban by {ctx.author})")
+            
+            await ctx.send(embed=create_success(
+                "Hackban Successful", 
+                f"User {user} ({user.id}) has been banned.{dm_status}\nReason: {reason}"
+            ))
+            
+            await self.log(ctx.guild, create_mod_embed(
+                "Hackban", 
+                f"{ctx.author} hackbanned {user} ({user.id}). Reason: {reason}{dm_status}"
+            ))
+            
+            # Record ban in database
+            timestamp = datetime.datetime.utcnow().isoformat()
+            await self.execute_db(
+                "INSERT INTO banned_users (user_id, guild_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (str(user.id), str(ctx.guild.id), str(ctx.author.id), reason, timestamp)
+            )
+            
+        except discord.NotFound:
+            await ctx.send(embed=create_error("User not found. Please check the user ID."))
+        except discord.Forbidden:
+            await ctx.send(embed=create_error("I don't have permission to ban users."))
+        except Exception as e:
+            await ctx.send(embed=create_error(f"Could not hackban user: {e}"))
 
     @commands.command(name="kick")
-    @commands.has_permissions(kick_members=True)
+    @kick_or_admin_only()
     async def kick(self, ctx, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
         if await self.is_protected(ctx.guild, member):
             await ctx.send(embed=create_error("Target is protected by safelist — action denied."))
             return
+        
+        # Send DM notification before kicking
+        dm_sent = await self.send_dm_notification(
+            user=member,
+            action="Kick",
+            reason=reason,
+            moderator=ctx.author
+        )
+        
+        dm_status = " (DM sent)" if dm_sent else " (DM failed)"
+        
         try:
             await member.kick(reason=f"{reason} (by {ctx.author})")
-            await ctx.send(embed=create_success("Kicked", f"{member} has been kicked."))
-            await self.log(ctx.guild, create_mod_embed("Kick", f"{ctx.author} kicked {member}. Reason: {reason}"))
+            await ctx.send(embed=create_success("Kicked", f"{member} has been kicked.{dm_status}"))
+            await self.log(ctx.guild, create_mod_embed("Kick", f"{ctx.author} kicked {member}. Reason: {reason}{dm_status}"))
             # Record kick in database
             timestamp = datetime.datetime.utcnow().isoformat()
             await self.execute_db(
@@ -772,10 +967,10 @@ class ModerationCog(commands.Cog):
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not kick member: {e}"))
 
-# ------------------------------------ whois ---------------------------------------
+    # ----------------- whois -----------------
 
     @commands.command(name="whois")
-    @staff_only()
+    @staff_or_mute_only()
     async def whois(self, ctx, member: discord.Member):
         # Check if jailed
         jailed = await self.fetchone_db(
